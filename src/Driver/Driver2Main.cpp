@@ -1,0 +1,283 @@
+/*
+ * This file is released under the terms of the Artistic License.  Please see
+ * the file LICENSE, included in this package, for details.
+ *
+ * Copyright The DBT-5 Authors
+ *
+ * Entry point for the event-driven Driver (Driver2).
+ * Reuses the same command-line interface as DriverMain.cpp.
+ */
+
+#include "Driver2.h"
+#include "DBT5Consts.h"
+
+// Establish defaults for command line options
+char szBHaddr[iMaxHostname + 1] = "localhost"; // Brokerage House address
+int iBHListenerPort = iBrokerageHousePort;
+// # of customers for this instance
+TIdent iConfiguredCustomerCount = iDefaultCustomerCount;
+// total number of customers in the database
+TIdent iActiveCustomerCount = iDefaultCustomerCount;
+int iScaleFactor = 500; // # of customers for 1 TRTPS
+int iDaysOfInitialTrades = 300;
+int iTestDuration = 0;
+int iSleep = 1000; // msec between thread creation (used for ramp-up stagger)
+int iUsers = 0; // # users
+int iPacingDelay = 0;
+
+char szInDir[iMaxPath + 1]; // path to EGen input files
+char outputDirectory[iMaxPath + 1] = "."; // path to output files
+// automatic RNG seed generation requires unique input
+UINT32 iSeed = 0;
+
+// shows program usage
+void
+usage()
+{
+	cout << "Usage: Driver2Main {options}" << endl
+		 << endl
+		 << "   Option      Default    Description" << endl
+		 << "   ==========  =========  ==============================="
+		 << endl;
+	printf("   -c integer  %-9ld  Configured customer count\n",
+			iActiveCustomerCount);
+	printf("   -d integer             Duration of the test (seconds)\n");
+	printf("   -f integer  %-9d  # of customers per 1 TRTPS\n", iScaleFactor);
+	printf("   -h string   %-9s  Brokerage House address\n", szBHaddr);
+	printf("   -i string   %-9s  Path to EGen flat_in directory\n", szInDir);
+	printf("   -n integer  %-9d  millisecond delay between transactions\n",
+			iPacingDelay);
+	printf("   -o string   %-9s  # directory for output files\n",
+			outputDirectory);
+	printf("   -p integer  %-9d  Brokerage House listener port\n",
+			iBHListenerPort);
+	printf("   -r integer             Random number generator seed\n");
+	printf("                          Invalidates run if used\n");
+	printf("   -t integer  %-9ld  Active customer count\n",
+			iConfiguredCustomerCount);
+	printf("   -u integer             # of Users\n");
+	printf("   -w integer  %-9d  # of Days of Initial Trades\n",
+			iDaysOfInitialTrades);
+	printf("   -y integer  %-9d  millisecond ramp-up stagger per user\n",
+			iSleep);
+}
+
+// Parse command line
+void
+parse_command_line(int argc, char *argv[])
+{
+	int arg;
+	char *sp;
+	char *vp;
+
+	// Scan the command line arguments
+	for (arg = 1; arg < argc; ++arg) {
+
+		// Look for a switch
+		sp = argv[arg];
+		if (*sp == '-') {
+			++sp;
+		}
+
+		/*
+		 *  Find the switch's argument.  It is either immediately after the
+		 *  switch or in the next argv
+		 */
+		vp = sp + 1;
+		// Allow for switches that don't have any parameters.
+		// Need to check that the next argument is in fact a parameter
+		// and not the next switch that starts with '-'.
+		//
+		if ((*vp == 0) && ((arg + 1) < argc) && (argv[arg + 1][0] != '-')) {
+			vp = argv[++arg];
+		}
+
+		// Parse the switch
+		switch (*sp) {
+		case 'c':
+			iActiveCustomerCount = atol(vp);
+			break;
+		case 'd':
+			iTestDuration = atoi(vp);
+			break;
+		case 'f':
+			iScaleFactor = atoi(vp);
+			break;
+		case 'h':
+			strncpy(szBHaddr, vp, iMaxHostname);
+			szBHaddr[iMaxHostname] = '\0';
+			break;
+		case 'i': // input files path
+			strncpy(szInDir, vp, iMaxPath);
+			szInDir[iMaxPath] = '\0';
+			break;
+		case 'n':
+			iPacingDelay = atoi(vp);
+			break;
+		case 'o':
+			strncpy(outputDirectory, vp, iMaxPath);
+			outputDirectory[iMaxPath] = '\0';
+			break;
+		case 'p':
+			iBHListenerPort = atoi(vp);
+			break;
+		case 'r':
+			iSeed = atoi(vp);
+			break;
+		case 't':
+			iConfiguredCustomerCount = atol(vp);
+			break;
+		case 'w':
+			iDaysOfInitialTrades = atoi(vp);
+			break;
+		case 'u':
+			iUsers = atoi(vp);
+			break;
+		case 'y':
+			iSleep = atoi(vp);
+			break;
+		default:
+			usage();
+			cout << endl << "Error: Unrecognized option: " << sp << endl;
+			exit(1);
+		}
+	}
+}
+
+// Validate Parameters
+bool
+ValidateParameters()
+{
+	bool bRet = true;
+
+	// Configured Customer count must be a non-zero integral multiple of load
+	// unit size.
+	if ((iDefaultLoadUnitSize > iConfiguredCustomerCount)
+			|| (0 != iConfiguredCustomerCount % iDefaultLoadUnitSize)) {
+		cerr << "The specified customer count (-c " << iConfiguredCustomerCount
+			 << ") must be a non-zero integral multiple of the load unit size "
+				"("
+			 << iDefaultLoadUnitSize << ")." << endl;
+
+		bRet = false;
+	}
+
+	// Active customer count must be a non-zero integral multiple of load unit
+	// size.
+	if ((iDefaultLoadUnitSize > iActiveCustomerCount)
+			|| (0 != iActiveCustomerCount % iDefaultLoadUnitSize)) {
+		cerr << "The total customer count (-a " << iActiveCustomerCount
+			 << ") must be a non-zero integral multiple of the load unit size "
+				"("
+			 << iDefaultLoadUnitSize << ")." << endl;
+
+		bRet = false;
+	}
+
+	// Completed trades in 8 hours must be a non-zero integral multiple of 100
+	// so that exactly 1% extra trade ids can be assigned to simulate aborts.
+	//
+	if ((INT64) (HoursPerWorkDay * SecondsPerHour * iDefaultLoadUnitSize
+				 / iScaleFactor)
+					% 100
+			!= 0) {
+		cerr << "Incompatible value for Scale Factor (-f) specified." << endl;
+		cerr << HoursPerWorkDay << " * " << SecondsPerHour
+			 << " * Load Unit Size (" << iDefaultLoadUnitSize
+			 << ") / Scale Factor (" << iScaleFactor
+			 << ") must be integral multiple of 100." << endl;
+
+		bRet = false;
+	}
+
+	if (iDaysOfInitialTrades <= 0) {
+		cerr << "The specified number of 8-Hour Workdays (-i "
+			 << (iDaysOfInitialTrades) << ") must be non-zero." << endl;
+
+		bRet = false;
+	}
+
+	// iUsers must be assigned
+	if (iUsers == 0) {
+		cerr << "The number of users must be specified." << endl;
+		bRet = false;
+	}
+
+	// iTestDuration must be assigned
+	if (iTestDuration == 0) {
+		cerr << "The duration of the test must be specified." << endl;
+		bRet = false;
+	}
+
+	return bRet;
+}
+
+int
+main(int argc, char *argv[])
+{
+	// Establish defaults for command line options
+	strncpy(szInDir, "flat_in", iMaxPath);
+
+	cout << "dbt5 - Driver2 Customer Emulator (event-driven)" << endl;
+
+	// Parse command line
+	parse_command_line(argc, argv);
+
+	char *pidFilename = new char[1024];
+	snprintf(pidFilename, 1023, "%s/driver.pid", outputDirectory);
+	FILE *fpid = fopen(pidFilename, "w");
+	if (fpid == NULL) {
+		cerr << "ERROR: can't create pid file: " << pidFilename << endl;
+		return 1;
+	}
+	fprintf(fpid, "%d", getpid());
+	fclose(fpid);
+	delete[] pidFilename;
+
+	// Validate parameters
+	if (!ValidateParameters()) {
+		return 2; // exit returning a non-zero code
+	}
+
+	// Let the user know what settings will be used.
+	cout << "Using the following settings:" << endl << endl;
+
+	cout << "Input files location: " << szInDir << endl << endl;
+
+	cout << "Brokerage House address: " << szBHaddr << endl;
+	cout << "Brokerage House port: " << iBHListenerPort << endl << endl;
+
+	cout << "Configured customer count: " << iConfiguredCustomerCount << endl;
+	cout << "Active customer count: " << iActiveCustomerCount << endl;
+	cout << "Days of initial trades: " << iDaysOfInitialTrades << endl;
+	cout << "Scale Factor: " << iScaleFactor << endl << endl;
+
+	cout << "Users: " << iUsers << endl;
+	cout << "Ramp-up stagger per user (msec): " << iSleep << endl << endl;
+
+	cout << "Test duration (sec): " << iTestDuration << endl;
+	cout << "Pacing Delay (msec): " << iPacingDelay << endl << endl;
+	cout << "Unique ID (seed): " << iSeed << endl;
+
+	try {
+		const DataFileManager inputFiles(szInDir, iConfiguredCustomerCount,
+				iActiveCustomerCount, TPCE::DataFileManager::IMMEDIATE_LOAD);
+
+		start_driver(inputFiles, szInDir, iConfiguredCustomerCount,
+				iActiveCustomerCount, iScaleFactor, iDaysOfInitialTrades,
+				iSeed, szBHaddr, iBHListenerPort, iUsers, iPacingDelay,
+				outputDirectory, iSleep, iTestDuration);
+
+	} catch (CBaseErr *pErr) {
+		cout << endl
+			 << "Error " << pErr->ErrorNum() << ": " << pErr->ErrorText();
+		if (pErr->ErrorLoc()) {
+			cout << " at " << pErr->ErrorLoc() << endl;
+		} else {
+			cout << endl;
+		}
+		return (1);
+	}
+
+	return (0);
+}
